@@ -1,3 +1,48 @@
+> ## 🧩 Fork CDF: extração de dependências NetSuite (AMD `define()`)
+>
+> Este é um fork do [graphify original](https://github.com/Graphify-Labs/graphify) com uma extensão
+> para código SuiteScript (NetSuite). O graphify original entende `import`/`require()` de
+> JS/TS normal, mas não entende o padrão AMD que o NetSuite usa:
+>
+> ```js
+> define(['./WMSModule.js', 'N/record'], function(wms, record) { ... })
+> ```
+>
+> Sem essa extensão, esses vínculos entre arquivos simplesmente não apareciam no grafo — uma
+> pergunta como "quem usa esse módulo?" respondia "ninguém", mesmo quando a resposta certa era
+> "3 arquivos usam". Esse fork adiciona um extrator (`_amd_define_imports_js` em
+> [`graphify/extractors/engine.py`](graphify/extractors/engine.py)) que:
+>
+> - Lê o array de dependências do `define([...])` e resolve cada caminho pro arquivo real
+>   (edges `imports_from`, mesmo tipo que o graphify já usa pra `require()`/`import`).
+> - Módulos nativos do NetSuite (`N/record`, `N/search`, etc.) viram nós externos — não geram
+>   falso vínculo com arquivo nenhum.
+> - Cobre também o caso em que o path no `define()` é absoluto do File Cabinet
+>   (ex: `SuiteScripts/wms/cdf_wmsModulo.js`) e não bate com a pasta real do repo — nesse caso
+>   ele resolve por nome de arquivo, e só cria o vínculo quando o nome é único no repo (edge
+>   marcada como `INFERRED` em vez de `EXTRACTED`, pra deixar claro que foi inferido e não lido
+>   direto do import).
+>
+> **Instalação (pro time CDF, ou qualquer um que use scripts NetSuite AMD-style):**
+>
+> ```bash
+> uv tool install git+https://github.com/vimassaru/graphify.git
+> graphify install               # registra a skill no seu assistente (Claude Code, Cursor, etc.)
+> ```
+>
+> Depois disso, o uso é idêntico ao graphify normal — dentro do seu assistente:
+>
+> ```
+> /graphify .
+> ```
+>
+> Se você já tem o graphify original instalado, pode trocar sem conflito: `uv tool install`
+> substitui o pacote `graphifyy` pela versão deste fork (mesmo nome de comando `graphify`).
+>
+> Esse fork acompanha o projeto original (`git remote add upstream
+> https://github.com/Graphify-Labs/graphify.git` já configurado) e recebe atualizações de lá
+> por cima da extensão de NetSuite.
+
 <p align="center">
   <a href="https://graphify.com"><img src="https://raw.githubusercontent.com/Graphify-Labs/graphify/v8/docs/graphify-logo.png" width="480" height="252" alt="Graphify"/></a>
 </p>

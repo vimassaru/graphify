@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
 from graphify.extractors.base import _LANGUAGE_BUILTIN_GLOBALS, _file_stem, _make_id, _read_text
 from graphify.ids import normalize_id
 from graphify.extractors.models import LanguageConfig
@@ -2036,6 +2037,141 @@ def _find_require_call(value_node):
         return _find_require_call(obj)
     return None
 
+# Cache of {project_root: {basename: [Path, ...]}}, so a repo's file tree is
+# only walked once regardless of how many define() calls reference it.
+_AMD_BASENAME_INDEX_CACHE: dict[str, dict] = {}
+
+_AMD_INDEX_SKIP_DIRS = frozenset({
+    ".git", ".svn", ".hg", "node_modules", "graphify-out", "dist", "build", ".venv",
+})
+
+
+def _find_amd_project_root(start: Path) -> "Path | None":
+    """Climb from `start` looking for a `.git` directory to bound the basename
+    search. Without a bound, a huge unrelated ancestor directory could get
+    walked for every unresolved define() dependency."""
+    cur = start
+    for _ in range(25):
+        if (cur / ".git").exists():
+            return cur
+        if cur.parent == cur:
+            return None
+        cur = cur.parent
+    return None
+
+
+def _amd_basename_index(root: Path) -> dict:
+    key = str(root)
+    cached = _AMD_BASENAME_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+    index: dict[str, list[Path]] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _AMD_INDEX_SKIP_DIRS and not d.startswith(".")]
+        for fname in filenames:
+            index.setdefault(fname, []).append(Path(dirpath) / fname)
+    _AMD_BASENAME_INDEX_CACHE[key] = index
+    return index
+
+
+def _resolve_amd_path_by_basename(raw: str, str_path: str) -> "Path | None":
+    """Fallback for NetSuite File Cabinet-absolute define() deps, e.g.
+    'SuiteScripts/wms/cdf_wmsModulo.js', which don't resolve as relative JS
+    imports because the File Cabinet path doesn't mirror the repo's own
+    directory layout (confirmed on cdf_wmsSuitelet.js: SuiteScripts/wms/... on
+    disk is actually production/wms/... in this repo).
+
+    Matches on filename alone within the enclosing git repo. Only returns a
+    match when it is unique — an ambiguous basename (two files sharing a name
+    in different folders) is left unresolved rather than risk a wrong edge.
+    """
+    basename = raw.rsplit("/", 1)[-1]
+    if not basename or "." not in basename:
+        return None
+    root = _find_amd_project_root(Path(str_path).parent)
+    if root is None:
+        return None
+    matches = _amd_basename_index(root).get(basename)
+    if not matches or len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _amd_define_imports_js(call_node, source: bytes, importer_nid: str, edges: list, str_path: str) -> bool:
+    """Detect RequireJS/NetSuite-AMD `define([...], function(...){...})` imports.
+
+    NetSuite SuiteScript 2.x modules declare their dependencies as an AMD
+    array rather than CommonJS `require()` calls:
+        define(['./WMSModule.js', 'N/record'], function(wms, record) {...})
+        define('moduleId', ['./a.js'], function(a) {...})   // named variant
+    Stock graphify has no notion of this shape, so these cross-file
+    dependencies never became edges (confirmed by a control check: a known
+    real `define()` dependency produced zero edges before this function).
+
+    Emits the same `imports_from` relation `_require_imports_js` uses for CJS
+    `require()`, so downstream consumers (exporters, resolution) treat AMD
+    deps identically to CJS imports. Unlike CJS destructuring there is no
+    named symbol to extract from a bare AMD dependency, so no per-symbol
+    `imports` edge is emitted here.
+
+    Returns True if `call_node` is recognized as a `define(...)` call at all
+    (even with zero resolvable dependencies), so the caller can treat the
+    statement as handled.
+    """
+    if call_node.type != "call_expression":
+        return False
+    fn = call_node.child_by_field_name("function")
+    if fn is None or fn.type != "identifier" or _read_text(fn, source) != "define":
+        return False
+    args = call_node.child_by_field_name("arguments")
+    if args is None:
+        return False
+
+    deps_node = next((a for a in args.children if a.type == "array"), None)
+    if deps_node is None:
+        return True
+
+    line = call_node.start_point[0] + 1
+    for el in deps_node.children:
+        if el.type != "string":
+            continue
+        raw = _read_text(el, source).strip("'\"` ")
+        if not raw:
+            continue
+        resolved = _resolve_js_import_target(raw, str_path)
+        if resolved is None:
+            continue
+        tgt_nid, resolved_path = resolved
+        confidence = "EXTRACTED"
+        # Bare `N/xxx` (and similarly-shaped `SuiteScripts/N/xxx`) specifiers
+        # are NetSuite's own core API modules, not File Cabinet files — never
+        # try to resolve those by basename, only genuine local .js deps.
+        is_core_ns_module = raw == "N" or raw.startswith("N/") or "/N/" in raw
+        if resolved_path is None and raw.endswith(".js") and not is_core_ns_module:
+            fallback_path = _resolve_amd_path_by_basename(raw, str_path)
+            if fallback_path is not None:
+                resolved_path = fallback_path
+                tgt_nid = _make_id(str(fallback_path))
+                # Basename-only match (the File Cabinet path doesn't mirror the
+                # repo layout) — mark it below EXTRACTED confidence so it reads
+                # differently from a directly-resolved relative import.
+                confidence = "INFERRED"
+        edge = {
+            "source": importer_nid,
+            "target": tgt_nid,
+            "relation": "imports_from",
+            "context": "import",
+            "confidence": confidence,
+            "source_file": str_path,
+            "source_location": f"L{line}",
+            "weight": 1.0,
+        }
+        if resolved_path is not None:
+            edge["target_file"] = str(resolved_path)
+        edges.append(edge)
+    return True
+
+
 def _require_imports_js(node, source: bytes, importer_nid: str, stem: str, edges: list, str_path: str) -> bool:
     """Detect CommonJS require imports inside lexical_declaration / variable_declaration.
 
@@ -2422,6 +2558,8 @@ def _js_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
         # (the #1077 guard's requirement).
         call_stmt = next((c for c in node.children
                           if c.type in ("call_expression", "new_expression")), None)
+        if call_stmt is not None:
+            _amd_define_imports_js(call_stmt, source, file_nid, edges, str_path)
         if call_stmt is not None:
             _stmt_closures: list = []
             _js_topmost_closures(call_stmt, _stmt_closures)
